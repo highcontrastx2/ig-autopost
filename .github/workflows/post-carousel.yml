@@ -1,0 +1,82 @@
+name: Post next carousel
+
+on:
+  schedule:
+    # Every 10 minutes. The script itself decides if it is time to post.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (post nothing)"
+        type: boolean
+        default: false
+      test_alert:
+        description: "Send a test alert only (posts nothing)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: ig-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Create test alert
+        if: ${{ inputs.test_alert }}
+        run: echo "This is a test alert. Everything is working. Safe to close." > alert.txt
+
+      - name: Publish on schedule
+        if: ${{ !inputs.test_alert }}
+        env:
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          PUBLIC_BASE_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/carousels
+          GRAPH_HOST: ${{ vars.GRAPH_HOST }}
+          DEFAULT_CAPTION: ${{ vars.DEFAULT_CAPTION }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: python post_next.py
+
+      - name: Save posted log
+        if: always()
+        run: |
+          git config user.name "carousel-bot"
+          git config user.email "carousel-bot@users.noreply.github.com"
+          git add posted.json
+          git diff --cached --quiet || (git commit -m "Log posted carousel" && git push)
+
+      - name: Notify me if something is wrong
+        if: always() && hashFiles('alert.txt') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NTFY_TOPIC: ${{ vars.NTFY_TOPIC }}
+          TEST: ${{ inputs.test_alert }}
+        run: |
+          TITLE="Carousel posting stopped"
+          if [ "$TEST" = "true" ]; then TITLE="Test alert (safe to close)"; fi
+          MSG="$(cat alert.txt)"
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          # Only alert once per problem: skip if an alert issue is already open.
+          OPEN=$(gh issue list --state open --json title --jq "[.[] | select(.title==\"$TITLE\")] | length")
+          if [ "$OPEN" = "0" ]; then
+            gh issue create --title "$TITLE" --body "$MSG"$'\n\n'"Details: $RUN_URL"$'\n\n'"Fix the problem, then close this issue so you get alerted next time."
+            if [ -n "$NTFY_TOPIC" ]; then
+              curl -fsS -H "Title: $TITLE" -d "$MSG" "https://ntfy.sh/$NTFY_TOPIC" || true
+            fi
+          else
+            echo "Alert already open; not sending another."
+          fi
