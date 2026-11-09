@@ -1,6 +1,6 @@
 {
   "timezone": "America/New_York",
-  "start": "00:20",
-  "end": "00:50",
-  "per_day": 3
+  "start": "06:00",
+  "end": "13:45",
+  "per_day": "all"
 }
