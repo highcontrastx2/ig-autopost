@@ -2,6 +2,5 @@
   "timezone": "America/New_York",
   "start": "18:15",
   "end": "22:00",
-  "per_day": "all",
-  "post_type": "carousel"
+  "per_day": "all"
 }
