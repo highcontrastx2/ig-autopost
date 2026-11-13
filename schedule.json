@@ -1,6 +1,11 @@
 {
   "timezone": "America/New_York",
-  "start": "18:15",
-  "end": "22:00",
-  "per_day": "all"
+  "start": "13:00",
+  "end": "15:30",
+  "per_day": "all",
+  "distribution": {
+    "mode": "even",
+    "start_date": "2026-11-13",
+    "days": 7
+  }
 }
