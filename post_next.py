@@ -12,6 +12,11 @@ The first post goes out at `start`; after each post the remaining ones are
 re-spaced so the last one lands at `end`. Late starts and delayed runs fix
 themselves automatically.
 
+If schedule.json includes a `distribution` block with mode `even`, the remaining
+queue is also split as evenly as possible across that fixed date window. The
+per-day count is recalculated from the remaining queue and days, so missed days
+are rebalanced automatically. `per_day` remains the safety cap (50 when `all`).
+
 Slide files can be 1.jpg / 2.jpg or 01.jpg / 02.jpg; they are ordered by number.
 
 Env vars
@@ -33,7 +38,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -148,6 +153,45 @@ def plan(now, times, quota, start, end):
     return False, next_due, f"Next post due at {next_due:%H:%M}."
 
 
+def daily_cap(cfg: dict) -> int:
+    """Read per_day as a ceiling; `all` means the hard safety limit."""
+    raw = cfg.get("per_day", "all")
+    if raw == "all":
+        return MAX_PER_DAY
+    try:
+        cap = int(raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError("`per_day` must be a positive number or \"all\".") from e
+    if cap < 1:
+        raise ValueError("`per_day` must be at least 1.")
+    return min(cap, MAX_PER_DAY)
+
+
+def distribution_window(cfg: dict):
+    """Return inclusive (first_day, last_day), or (None, None) for legacy mode."""
+    settings = cfg.get("distribution")
+    if settings is None:
+        return None, None
+    if not isinstance(settings, dict) or settings.get("mode") != "even":
+        raise ValueError("`distribution` must be an object with mode `even`.")
+    try:
+        first_day = date.fromisoformat(settings["start_date"])
+        days = int(settings["days"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError("`distribution` needs an ISO `start_date` and positive `days`.") from e
+    if days < 1:
+        raise ValueError("`distribution.days` must be at least 1.")
+    return first_day, first_day + timedelta(days=days - 1)
+
+
+def even_daily_quota(queue_count: int, posted_today_count: int, days_left: int) -> int:
+    """Ceiling division, counting today's completed posts so the target stays fixed."""
+    if days_left < 1:
+        raise ValueError("days_left must be at least 1")
+    pending_for_window = queue_count + posted_today_count
+    return (pending_for_window + days_left - 1) // days_left
+
+
 # ---------- alerts ----------
 _alerted = False
 
@@ -213,10 +257,15 @@ def publish(folder: Path) -> str:
 
 # ---------- main ----------
 def main() -> int:
-    cfg = json.loads(SCHEDULE.read_text())
-    tz = ZoneInfo(cfg["timezone"])
-    per_day = cfg.get("per_day", "all")
-    cap = MAX_PER_DAY if per_day == "all" else min(int(per_day), MAX_PER_DAY)
+    try:
+        cfg = json.loads(SCHEDULE.read_text())
+        tz = ZoneInfo(cfg["timezone"])
+        cap = daily_cap(cfg)
+        spread_start, spread_end = distribution_window(cfg)
+    except Exception as e:
+        alert(f"Invalid schedule settings: {e}")
+        return 1
+
     single = DRY_RUN or bool(os.environ.get("NOW_OVERRIDE"))  # test modes: one pass only
     stop_at = time.time() + LOOP_SECONDS
 
@@ -246,8 +295,31 @@ def main() -> int:
             alert("Stopped to keep folder order. " + problem)
             return 1
 
+        if spread_start is not None and now.date() < spread_start:
+            first_slot = at(spread_start, cfg["start"], tz)
+            print(f"Schedule window starts {spread_start.isoformat()} at {cfg['start']}; waiting.")
+            if single:
+                return 0
+            wait = (first_slot - now).total_seconds()
+            if time.time() + wait > stop_at:
+                return 0
+            time.sleep(max(wait, 1))
+            continue
+
+        if spread_end is not None and now.date() > spread_end:
+            alert(f"7-day schedule ended on {spread_end.isoformat()} with {len(queue)} unposted carousel(s). Extend the distribution window or update the schedule.")
+            return 0
+
         times = posted_today(entries, tz, now.date())
-        quota = min(cap, len(queue) + len(times))
+        if spread_start is not None:
+            days_left = (spread_end - now.date()).days + 1
+            quota = even_daily_quota(len(queue), len(times), days_left)
+            if quota > cap:
+                alert(f"Cannot evenly distribute the remaining {len(queue) + len(times)} carousel(s) across {days_left} day(s): this needs {quota} posts/day, above the configured per_day cap of {cap}.")
+                return 1
+        else:
+            quota = min(cap, len(queue) + len(times))
+
         post_now, next_due, why = plan(now, times, quota, start, end)
         print(f"[{now:%Y-%m-%d %H:%M:%S}] today {len(times)}/{quota} posted, {len(queue)} in queue. {why}")
 
